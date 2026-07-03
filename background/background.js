@@ -119,6 +119,47 @@ async function shouldFocusTabs() {
   return mheWindowId === aiWindowId;
 }
 
+async function findMheTabId() {
+  if (mheTabId) return mheTabId;
+
+  const mheTabs = await chrome.tabs.query({
+    url: [
+      "https://learning.mheducation.com/*",
+      "https://ezto.mheducation.com/*",
+    ],
+  });
+
+  if (mheTabs.length > 0) {
+    mheTabId = mheTabs[0].id;
+    mheWindowId = mheTabs[0].windowId;
+    return mheTabId;
+  }
+
+  return null;
+}
+
+async function alertAndStopAutomation(message, preferredTabId = null) {
+  const targetTabId = preferredTabId || (await findMheTabId());
+  if (!targetTabId) return;
+
+  try {
+    await sendMessageWithRetry(targetTabId, {
+      type: "alertMessage",
+      message,
+    });
+  } catch (error) {
+    console.error("Unable to show automation alert:", error);
+  }
+
+  try {
+    await sendMessageWithRetry(targetTabId, {
+      type: "stopAutomation",
+    });
+  } catch (error) {
+    console.error("Unable to stop automation:", error);
+  }
+}
+
 async function processQuestion(message) {
   if (processingQuestion) return;
   processingQuestion = true;
@@ -127,13 +168,10 @@ async function processQuestion(message) {
     await findAndStoreTabs();
 
     if (!aiTabId) {
-      await sendMessageWithRetry(mheTabId, {
-        type: "alertMessage",
-        message: `Please open ${aiType} in another tab before using automation.`,
-      });
-      await sendMessageWithRetry(mheTabId, {
-        type: "stopAutomation",
-      });
+      await alertAndStopAutomation(
+        `Please open ${aiType} in another tab before using automation.`,
+        mheTabId || message.sourceTabId
+      );
       processingQuestion = false;
       return;
     }
@@ -142,6 +180,7 @@ async function processQuestion(message) {
       mheTabId = message.sourceTabId;
     }
 
+    const returnTabId = message.sourceTabId || mheTabId || lastActiveTabId;
     const sameWindow = await shouldFocusTabs();
 
     if (sameWindow) {
@@ -149,25 +188,36 @@ async function processQuestion(message) {
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
 
-    await sendMessageWithRetry(aiTabId, {
+    const aiResponse = await sendMessageWithRetry(aiTabId, {
       type: "receiveQuestion",
       question: message.question,
     });
 
-    if (sameWindow && lastActiveTabId && lastActiveTabId !== aiTabId) {
+    if (!aiResponse || aiResponse.received === false) {
+      if (sameWindow && returnTabId && returnTabId !== aiTabId) {
+        await focusTab(returnTabId);
+      }
+
+      await alertAndStopAutomation(
+        `Error sending the question to ${aiType}: ${
+          aiResponse?.error || "the assistant page did not accept the prompt"
+        }.`,
+        returnTabId || mheTabId
+      );
+      return;
+    }
+
+    if (sameWindow && returnTabId && returnTabId !== aiTabId) {
       setTimeout(async () => {
-        await focusTab(lastActiveTabId);
+        await focusTab(returnTabId);
       }, 1000);
     }
   } catch (error) {
     if (mheTabId) {
-      await sendMessageWithRetry(mheTabId, {
-        type: "alertMessage",
-        message: `Error communicating with ${aiType}. Please make sure it's open in another tab.`,
-      });
-      await sendMessageWithRetry(mheTabId, {
-        type: "stopAutomation",
-      });
+      await alertAndStopAutomation(
+        `Error communicating with ${aiType}. Please make sure it's open in another tab.`,
+        mheTabId
+      );
     }
   } finally {
     processingQuestion = false;
@@ -226,6 +276,23 @@ async function processResponse(message) {
   } catch (error) {
     console.error("Error processing AI response:", error);
   }
+}
+
+async function processAiWorkflowError(message) {
+  const targetTabId = await findMheTabId();
+  if (!targetTabId) return;
+
+  const sameWindow = await shouldFocusTabs();
+  if (sameWindow) {
+    await focusTab(targetTabId);
+  }
+
+  await alertAndStopAutomation(
+    `${message.aiType || aiType || "The selected assistant"} did not return a usable answer. ${
+      message.message || "Please check the assistant tab and try again."
+    }`,
+    targetTabId
+  );
 }
 
 async function waitForTabReady(tabId, maxAttempts = 8) {
@@ -292,6 +359,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     message.type === "deepseekResponse"
   ) {
     processResponse(message);
+    sendResponse({ received: true });
+    return true;
+  }
+
+  if (message.type === "aiWorkflowError") {
+    processAiWorkflowError(message);
     sendResponse({ received: true });
     return true;
   }
