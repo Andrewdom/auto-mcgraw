@@ -207,11 +207,8 @@ async function processQuestion(message) {
       return;
     }
 
-    if (sameWindow && returnTabId && returnTabId !== aiTabId) {
-      setTimeout(async () => {
-        await focusTab(returnTabId);
-      }, 1000);
-    }
+    // Keep the AI tab active while it generates. processResponse switches back
+    // to McGraw only after a usable answer arrives.
   } catch (error) {
     if (mheTabId) {
       await alertAndStopAutomation(
