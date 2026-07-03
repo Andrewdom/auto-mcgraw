@@ -225,7 +225,12 @@ function processResponse(responseText) {
   try {
     const parsed = JSON.parse(cleanedText);
 
-    if (parsed && parsed.answer && !hasResponded) {
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      Object.prototype.hasOwnProperty.call(parsed, "answer") &&
+      !hasResponded
+    ) {
       hasResponded = true;
       chrome.runtime
         .sendMessage({
@@ -330,7 +335,16 @@ function startObserving() {
   observationStartTime = Date.now();
   observationTimeout = setTimeout(() => {
     if (!hasResponded) {
-      resetObservation();
+      hasResponded = true;
+      chrome.runtime
+        .sendMessage({
+          type: "aiWorkflowError",
+          aiType: "DeepSeek",
+          message: "Timed out waiting for DeepSeek to return a usable JSON answer.",
+        })
+        .finally(() => {
+          resetObservation();
+        });
     }
   }, 180000);
 
