@@ -125,7 +125,16 @@ function startObserving() {
   observationStartTime = Date.now();
   observationTimeout = setTimeout(() => {
     if (!hasResponded) {
-      resetObservation();
+      hasResponded = true;
+      chrome.runtime
+        .sendMessage({
+          type: "aiWorkflowError",
+          aiType: "Gemini",
+          message: "Timed out waiting for Gemini to return a usable JSON answer.",
+        })
+        .finally(() => {
+          resetObservation();
+        });
     }
   }, 180000);
 
@@ -162,7 +171,12 @@ function startObserving() {
 
     try {
       const parsed = JSON.parse(responseText);
-      if (parsed.answer && !hasResponded) {
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        Object.prototype.hasOwnProperty.call(parsed, "answer") &&
+        !hasResponded
+      ) {
         hasResponded = true;
         chrome.runtime
           .sendMessage({
