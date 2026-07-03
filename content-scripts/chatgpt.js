@@ -89,10 +89,19 @@ function getMessageSignature(message) {
 
 function findChatInput() {
   for (const selector of CHAT_INPUT_SELECTORS) {
-    const input = document.querySelector(selector);
-    if (input) return input;
+    const inputs = Array.from(document.querySelectorAll(selector));
+    const usableInput = inputs.find((input) => isInputUsable(input));
+    if (usableInput) return usableInput;
+    if (inputs[0]) return inputs[0];
   }
   return null;
+}
+
+function isInputUsable(input) {
+  if (!input) return false;
+  if (input.disabled || input.readOnly) return false;
+  if (input.getAttribute("aria-disabled") === "true") return false;
+  return input.getClientRects().length > 0 || input.isContentEditable;
 }
 
 function isButtonUsable(button) {
@@ -125,6 +134,16 @@ function findSendButton() {
   return null;
 }
 
+async function waitForChatInput(timeout = 10000) {
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeout) {
+    const chatInput = findChatInput();
+    if (chatInput) return chatInput;
+    await delay(100);
+  }
+  return null;
+}
+
 function setNativeValue(element, value) {
   const prototype = Object.getPrototypeOf(element);
   const valueSetter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
@@ -136,6 +155,59 @@ function setNativeValue(element, value) {
   }
 }
 
+function dispatchInputEvents(element, text) {
+  try {
+    element.dispatchEvent(
+      new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: text,
+      })
+    );
+  } catch (e) {}
+
+  try {
+    element.dispatchEvent(
+      new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: text,
+      })
+    );
+  } catch (e) {
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  element.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function selectElementContents(element) {
+  const selection = window.getSelection();
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+function insertTextIntoContentEditable(element, text) {
+  element.focus();
+  selectElementContents(element);
+
+  const inserted = document.execCommand("insertText", false, text);
+  if (inserted && element.textContent.includes(text.slice(0, 40))) {
+    return true;
+  }
+
+  element.innerHTML = "";
+  text.split("\n").forEach((line) => {
+    const paragraph = document.createElement("p");
+    paragraph.textContent = line || "\u00a0";
+    element.appendChild(paragraph);
+  });
+  return true;
+}
+
 function updateChatInputValue(chatInput, text) {
   chatInput.focus();
 
@@ -145,19 +217,28 @@ function updateChatInputValue(chatInput, text) {
   ) {
     setNativeValue(chatInput, text);
   } else if (chatInput.isContentEditable) {
-    chatInput.innerHTML = "";
-    text.split("\n").forEach((line) => {
-      const paragraph = document.createElement("p");
-      paragraph.textContent = line || "\u00a0";
-      chatInput.appendChild(paragraph);
-    });
+    insertTextIntoContentEditable(chatInput, text);
   } else {
     return false;
   }
 
-  chatInput.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
-  chatInput.dispatchEvent(new Event("change", { bubbles: true }));
+  dispatchInputEvents(chatInput, text);
   return true;
+}
+
+function getInputText(chatInput) {
+  if (
+    chatInput instanceof HTMLTextAreaElement ||
+    chatInput instanceof HTMLInputElement
+  ) {
+    return chatInput.value || "";
+  }
+
+  return chatInput.textContent || "";
+}
+
+function isComposerEmpty(chatInput) {
+  return getInputText(chatInput).replace(/\u00a0/g, " ").trim() === "";
 }
 
 async function waitForSendButton(timeout = 5000) {
@@ -168,6 +249,58 @@ async function waitForSendButton(timeout = 5000) {
     await delay(100);
   }
   return null;
+}
+
+function pressEnterToSend(chatInput) {
+  chatInput.focus();
+  ["keydown", "keypress", "keyup"].forEach((type) => {
+    chatInput.dispatchEvent(
+      new KeyboardEvent(type, {
+        key: "Enter",
+        code: "Enter",
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true,
+      })
+    );
+  });
+}
+
+async function waitForSendAccepted(chatInput, timeout = 3000) {
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeout) {
+    if (isChatGPTGenerating()) return true;
+    if (isComposerEmpty(chatInput)) return true;
+    if (getAssistantMessages().length > messageCountAtQuestion) return true;
+    await delay(100);
+  }
+  return false;
+}
+
+async function submitQuestion(chatInput) {
+  const sendButton = await waitForSendButton(5000);
+
+  if (sendButton) {
+    sendButton.click();
+    if (await waitForSendAccepted(chatInput)) return true;
+  }
+
+  pressEnterToSend(chatInput);
+  if (await waitForSendAccepted(chatInput)) return true;
+
+  const form = chatInput.closest("form");
+  if (form?.requestSubmit) {
+    const submitButton = findSendButton();
+    if (submitButton) {
+      form.requestSubmit(submitButton);
+    } else {
+      form.requestSubmit();
+    }
+    if (await waitForSendAccepted(chatInput)) return true;
+  }
+
+  return false;
 }
 
 async function insertQuestion(questionData) {
@@ -210,7 +343,7 @@ async function insertQuestion(questionData) {
     '\n\nIMPORTANT: Your answer should be in a JSON code block.' +
     '\n\nPlease provide your answer in JSON format with keys "answer" and "explanation". Explanations should be no more than one sentence. DO NOT acknowledge the correction in your response, only answer the new question.';
 
-  const inputArea = findChatInput();
+  const inputArea = await waitForChatInput();
   if (!inputArea) {
     throw new Error("Input area not found");
   }
@@ -220,13 +353,12 @@ async function insertQuestion(questionData) {
     throw new Error("Unable to fill input area");
   }
 
-  const sendButton = await waitForSendButton();
-  if (!sendButton) {
-    throw new Error("Send button not found or disabled");
-  }
-
-  sendButton.click();
   startObserving();
+  const didSend = await submitQuestion(inputArea);
+  if (!didSend) {
+    resetObservation();
+    throw new Error("ChatGPT composer did not accept or submit the prompt");
+  }
 }
 
 function startObserving() {
